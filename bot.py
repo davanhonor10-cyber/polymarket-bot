@@ -195,7 +195,9 @@ Respond in this exact JSON format only, no other text:
             },
             timeout=20
         )
-        r.raise_for_status()
+        if not r.ok:
+            log.error(f"Claude API {r.status_code}: {r.text}")
+            return {"approve": False, "confidence": 0, "reason": str(r.text), "exit_target": 0}
         raw = r.json()["content"][0]["text"].strip()
 
         # Strip markdown fences if present
