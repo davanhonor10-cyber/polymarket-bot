@@ -189,7 +189,7 @@ Respond in this exact JSON format only, no other text:
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-haiku-4-5-20251001",
+                "model": "claude-haiku-4-5",
                 "max_tokens": 200,
                 "messages": [{"role": "user", "content": prompt}]
             },
