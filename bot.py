@@ -282,6 +282,19 @@ def process_new_trade(trade: dict, trader_label: str):
     price    = float(trade.get("price", 0))
     token_id = trade.get("asset", "")
 
+    # Skip old trades
+    trade_time = trade.get("timestamp", "") or trade.get("createdAt", "")
+    if trade_time:
+        try:
+            from datetime import datetime, timezone, timedelta
+            t = datetime.fromisoformat(trade_time.replace("Z", "+00:00"))
+            age_minutes = (datetime.now(timezone.utc) - t).total_seconds() / 60
+            if age_minutes > float(os.environ.get("MAX_TRADE_AGE_MINUTES", "30")):
+                log.info(f"⏭️  Skipped — trade is {age_minutes:.0f} mins old")
+                return
+        except:
+            pass
+            
     log.info(f"🔍 {trader_label}: [{outcome}] '{title}' @ {price:.3f}")
 
     if price < MIN_ODDS or price > MAX_ODDS:
