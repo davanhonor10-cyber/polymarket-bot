@@ -339,7 +339,7 @@ def run():
     while True:
         try:
             for wallet, label in traders:
-                trades = get_recent_trades(wallet, limit=10)
+                trades = get_recent_trades(wallet, limit=50)
                 for trade in trades:
                     tx = trade.get("transactionHash", "")
                     if tx and tx not in seen_trades:
