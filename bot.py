@@ -3,7 +3,7 @@ Polymarket Claude Copy Trading Bot
 - Monitors 2 traders for new positions
 - Sends each trade to Claude for analysis
 - Places $1 copy trades if approved
-- Monitors and exits positions based on rules
+- Uses /price endpoint (not /book which has a known Polymarket bug)
 """
 
 import os
@@ -14,7 +14,6 @@ import requests
 from datetime import datetime, timezone
 from typing import Optional
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -22,7 +21,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Config from environment variables
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 PK_PRIVATE_KEY    = os.environ["PK_PRIVATE_KEY"]
 PK_API_KEY        = os.environ["PK_API_KEY"]
@@ -39,6 +37,7 @@ MIN_ODDS          = float(os.environ.get("MIN_ODDS", "0.05"))
 MAX_ODDS          = float(os.environ.get("MAX_ODDS", "0.95"))
 EXIT_PROFIT_PCT   = float(os.environ.get("EXIT_PROFIT_PCT", "50"))
 EXIT_LOSS_PCT     = float(os.environ.get("EXIT_LOSS_PCT", "70"))
+MAX_SPREAD        = float(os.environ.get("MAX_SPREAD", "0.10"))
 
 DATA_API  = "https://data-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
@@ -59,19 +58,68 @@ def get_recent_trades(wallet: str, limit: int = 20) -> list:
         return []
 
 
-def get_market_orderbook(token_id: str) -> Optional[dict]:
+def get_token_price(token_id: str) -> Optional[dict]:
+    """
+    Use /price endpoint which returns live data.
+    /book endpoint has a known bug returning 0.01/0.99 ghost spreads.
+    Returns dict with buy_price, sell_price, spread, midpoint.
+    """
     try:
-        r = requests.get(f"{CLOB_API}/book", params={"token_id": token_id}, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        # Get buy price
+        r_buy = requests.get(
+            f"{CLOB_API}/price",
+            params={"token_id": token_id, "side": "BUY"},
+            timeout=10
+        )
+        r_sell = requests.get(
+            f"{CLOB_API}/price",
+            params={"token_id": token_id, "side": "SELL"},
+            timeout=10
+        )
+
+        if not r_buy.ok or not r_sell.ok:
+            log.warning(f"Price fetch failed: BUY={r_buy.status_code} SELL={r_sell.status_code}")
+            return None
+
+        buy_price  = float(r_buy.json().get("price", 1.0))
+        sell_price = float(r_sell.json().get("price", 0.0))
+        spread     = buy_price - sell_price
+        midpoint   = (buy_price + sell_price) / 2
+
+        log.info(f"💰 Price — BUY: {buy_price:.3f} | SELL: {sell_price:.3f} | Spread: {spread:.3f} | Mid: {midpoint:.3f}")
+
+        return {
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "spread": spread,
+            "midpoint": midpoint,
+            "has_liquidity": spread < MAX_SPREAD and buy_price > 0 and sell_price > 0
+        }
+
     except Exception as e:
-        log.error(f"Failed to fetch orderbook: {e}")
+        log.error(f"Failed to fetch price for {token_id[:10]}...: {e}")
+        return None
+
+
+def get_spread(token_id: str) -> Optional[float]:
+    """Use dedicated /spread endpoint as a cross-check."""
+    try:
+        r = requests.get(f"{CLOB_API}/spread", params={"token_id": token_id}, timeout=10)
+        if r.ok:
+            return float(r.json().get("spread", 1.0))
+        return None
+    except Exception as e:
+        log.error(f"Spread fetch failed: {e}")
         return None
 
 
 def get_my_positions() -> list:
     try:
-        r = requests.get(f"{DATA_API}/positions", params={"user": MY_PROXY_WALLET, "sizeThreshold": "0.01"}, timeout=10)
+        r = requests.get(
+            f"{DATA_API}/positions",
+            params={"user": MY_PROXY_WALLET, "sizeThreshold": "0.01"},
+            timeout=10
+        )
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
@@ -80,47 +128,10 @@ def get_my_positions() -> list:
         return []
 
 
-def check_liquidity(token_id: str, side: str) -> dict:
-    book = get_market_orderbook(token_id)
-
-    # Debug: log raw orderbook sample
-    if book:
-        bids_sample = book.get("bids", [])[:1]
-        asks_sample = book.get("asks", [])[:1]
-        log.info(f"📖 Orderbook sample — bids: {bids_sample} | asks: {asks_sample}")
-    else:
-        log.info("📖 Orderbook: None returned")
-
-    if not book:
-        return {"has_liquidity": False, "best_price": 0, "spread": 1, "depth_usdc": 0}
-
-    bids = book.get("bids", [])
-    asks = book.get("asks", [])
-
-    if not bids or not asks:
-        log.info("📖 Orderbook: empty bids or asks")
-        return {"has_liquidity": False, "best_price": 0, "spread": 1, "depth_usdc": 0}
-
-    best_bid = float(bids[0]["price"]) if bids else 0
-    best_ask = float(asks[0]["price"]) if asks else 1
-    spread = best_ask - best_bid
-
-    relevant = asks if side == "BUY" else bids
-    depth = sum(float(l["size"]) * float(l["price"]) for l in relevant[:5])
-    best_price = best_ask if side == "BUY" else best_bid
-
-    return {
-        "has_liquidity": spread < 0.15 and depth > 5,
-        "best_price": best_price,
-        "spread": spread,
-        "depth_usdc": depth
-    }
-
-
 # CLAUDE ANALYSIS
 
-def analyse_trade_with_claude(trade: dict, liquidity: dict) -> dict:
-    prompt = f"""You are an expert Polymarket prediction market analyst helping filter copy trades.
+def analyse_trade_with_claude(trade: dict, price_data: dict) -> dict:
+    prompt = f"""You are an expert Polymarket prediction market analyst filtering copy trades.
 
 Analyse this trade and decide whether to copy it with $1.
 
@@ -128,28 +139,28 @@ TRADE DETAILS:
 - Market: {trade.get('title', 'Unknown')}
 - Outcome: {trade.get('outcome', 'Unknown')}
 - Side: {trade.get('side', 'Unknown')}
-- Price paid by copied trader: {float(trade.get('price', 0)):.3f} (implies {float(trade.get('price', 0))*100:.1f}% probability)
+- Price paid by copied trader: {float(trade.get('price', 0)):.3f} ({float(trade.get('price', 0))*100:.1f}% implied probability)
 - Trader position size: ${float(trade.get('size', 0)) * float(trade.get('price', 0)):.2f} USDC
 
-MARKET LIQUIDITY:
-- Has adequate liquidity: {liquidity['has_liquidity']}
-- Best available price: {liquidity['best_price']:.3f}
-- Bid-ask spread: {liquidity['spread']:.3f}
-- Order book depth: ${liquidity['depth_usdc']:.2f} USDC
+CURRENT MARKET PRICES (live data):
+- Best BUY price: {price_data['buy_price']:.3f}
+- Best SELL price: {price_data['sell_price']:.3f}
+- Spread: {price_data['spread']:.3f}
+- Midpoint: {price_data['midpoint']:.3f}
+- Adequate liquidity: {price_data['has_liquidity']}
 
-RULES - REJECT if any of these apply:
-- Price < 0.05 or > 0.95 (near-certain outcome, no value)
-- Spread > 0.15 (too illiquid to enter/exit)
-- Depth < $5 (cannot exit position)
-- Market is very niche or unclear
+REJECTION RULES (any one = reject):
+- Spread > {MAX_SPREAD} (too wide, bad execution)
+- BUY price < 0.05 or > 0.95 (near-certain, no value)
+- Market is very niche, obscure, or unclear
 
-APPROVE if:
+APPROVAL CRITERIA:
+- Spread under {MAX_SPREAD}
 - Price between 0.05 and 0.95
-- Spread under 0.15
-- Depth over $5
-- Clear sports or crypto market
+- Clear sports or crypto market with reasonable volume
+- Copied trader entering at a price close to current midpoint (not chasing)
 
-Respond in this exact JSON format only, no other text:
+Respond in this exact JSON only, no other text:
 {{"approve": true or false, "confidence": 1-10, "reason": "one sentence", "exit_target": 0.0}}"""
 
     try:
@@ -226,10 +237,10 @@ def close_position(token_id: str, shares: float, current_price: float) -> bool:
             log.info(f"✅ Position closed @ {current_price}")
             return True
         else:
-            log.warning(f"Could not close position: {resp}")
+            log.warning(f"Could not close: {resp}")
             return False
     except Exception as e:
-        log.error(f"Close position failed: {e}")
+        log.error(f"Close failed: {e}")
         return False
 
 
@@ -241,22 +252,24 @@ def monitor_open_positions():
     my_positions = get_my_positions()
     current_map = {p["asset"]: p for p in my_positions}
     for token_id, entry in list(open_positions.items()):
+        if entry.get("dead"):
+            continue
         pos = current_map.get(token_id)
         if not pos:
-            log.info(f"Position {token_id[:10]}... resolved/closed — removing")
+            log.info(f"Position {entry['title'][:30]}... resolved — removing")
             del open_positions[token_id]
             continue
         entry_price   = entry["entry_price"]
         current_price = float(pos.get("curPrice", entry_price))
         shares        = float(pos.get("size", 0))
         pnl_pct       = ((current_price - entry_price) / entry_price) * 100
-        log.info(f"Position {entry['title'][:30]}... | Entry: {entry_price:.3f} | Now: {current_price:.3f} | P&L: {pnl_pct:+.1f}%")
+        log.info(f"📈 {entry['title'][:30]}... | Entry: {entry_price:.3f} | Now: {current_price:.3f} | P&L: {pnl_pct:+.1f}%")
         if pnl_pct >= EXIT_PROFIT_PCT:
-            log.info(f"Target hit ({pnl_pct:.1f}%) — closing")
+            log.info(f"🎯 Profit target hit ({pnl_pct:.1f}%) — closing")
             if close_position(token_id, shares, current_price):
                 del open_positions[token_id]
         elif pnl_pct <= -EXIT_LOSS_PCT:
-            log.info(f"Position down {pnl_pct:.1f}% — holding to resolution")
+            log.info(f"💀 Down {pnl_pct:.1f}% — holding to resolution")
             entry["dead"] = True
 
 
@@ -269,41 +282,49 @@ def process_new_trade(trade: dict, trader_label: str):
     price    = float(trade.get("price", 0))
     token_id = trade.get("asset", "")
 
-    log.info(f"🔍 New trade from {trader_label}: [{outcome}] on '{title}' @ {price:.3f}")
+    log.info(f"🔍 {trader_label}: [{outcome}] '{title}' @ {price:.3f}")
 
     if price < MIN_ODDS or price > MAX_ODDS:
-        log.info(f"Skipped — price {price:.3f} outside range [{MIN_ODDS}, {MAX_ODDS}]")
+        log.info(f"⏭️  Skipped — price {price:.3f} outside [{MIN_ODDS}, {MAX_ODDS}]")
         return
 
     if not token_id:
-        log.info("Skipped — no token_id")
+        log.info("⏭️  Skipped — no token_id")
         return
 
-    liquidity = check_liquidity(token_id, side)
-    log.info(f"📊 Liquidity — spread: {liquidity['spread']:.3f} | depth: ${liquidity['depth_usdc']:.2f}")
+    # Get live price data (avoids /book ghost spread bug)
+    price_data = get_token_price(token_id)
+    if not price_data:
+        log.info("⏭️  Skipped — could not fetch live price")
+        return
 
-    analysis = analyse_trade_with_claude(trade, liquidity)
-    log.info(f"🤖 Claude: approve={analysis['approve']} | confidence={analysis.get('confidence')}/10 | {analysis.get('reason')}")
+    if not price_data["has_liquidity"]:
+        log.info(f"⏭️  Skipped — spread too wide ({price_data['spread']:.3f} > {MAX_SPREAD})")
+        return
+
+    analysis = analyse_trade_with_claude(trade, price_data)
+    log.info(f"🤖 Claude: approve={analysis['approve']} | {analysis.get('confidence')}/10 | {analysis.get('reason')}")
 
     if not analysis["approve"]:
-        log.info("❌ Trade rejected")
+        log.info("❌ Rejected by Claude")
         return
 
     log.info(f"✅ Approved — placing ${TRADE_SIZE_USDC} trade")
-    order_id = place_trade(token_id, side, liquidity["best_price"], TRADE_SIZE_USDC)
+    entry_price = price_data["buy_price"] if side == "BUY" else price_data["sell_price"]
+    order_id = place_trade(token_id, side, entry_price, TRADE_SIZE_USDC)
 
     if order_id:
         open_positions[token_id] = {
             "title": title,
             "outcome": outcome,
-            "entry_price": liquidity["best_price"],
+            "entry_price": entry_price,
             "exit_target": analysis.get("exit_target", 0),
             "order_id": order_id,
             "trader": trader_label,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "dead": False
         }
-        log.info(f"📌 Position tracked | Target: {analysis.get('exit_target', 0):.3f}")
+        log.info(f"📌 Tracked | Target: {analysis.get('exit_target', 0):.3f}")
 
 
 def run():
@@ -312,8 +333,8 @@ def run():
         (TRADER_2, "Trader2"),
     ]
     log.info("🚀 Polymarket Claude Bot starting...")
-    log.info(f"   Monitoring: {TRADER_1[:10]}... & {TRADER_2[:10]}...")
-    log.info(f"   Trade size: ${TRADE_SIZE_USDC} | Poll: {POLL_INTERVAL}s")
+    log.info(f"   Traders: {TRADER_1[:10]}... & {TRADER_2[:10]}...")
+    log.info(f"   Size: ${TRADE_SIZE_USDC} | Poll: {POLL_INTERVAL}s | Max spread: {MAX_SPREAD}")
 
     while True:
         try:
