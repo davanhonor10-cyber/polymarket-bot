@@ -3,7 +3,7 @@ Polymarket Claude Copy Trading Bot
 - Monitors 2 traders for new positions
 - Sends each trade to Claude for analysis
 - Places $1 copy trades if approved
-- Uses /price endpoint (not /book which has a known Polymarket bug)
+- Telegram notifications for every decision
 """
 
 import os
@@ -27,6 +27,8 @@ PK_API_KEY        = os.environ["PK_API_KEY"]
 PK_API_SECRET     = os.environ["PK_API_SECRET"]
 PK_PASSPHRASE     = os.environ["PK_PASSPHRASE"]
 MY_PROXY_WALLET   = os.environ["MY_PROXY_WALLET"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
 TRADER_1          = os.environ.get("TRADER_1", "0x2005d16a84ceefa912d4e380cd32e7ff827875ea")
 TRADER_2          = os.environ.get("TRADER_2", "0x6e1d5040d0ac73709b0621f620d2a60b80d2d0fa")
@@ -34,10 +36,11 @@ TRADER_2          = os.environ.get("TRADER_2", "0x6e1d5040d0ac73709b0621f620d2a6
 POLL_INTERVAL     = int(os.environ.get("POLL_INTERVAL", "30"))
 TRADE_SIZE_USDC   = float(os.environ.get("TRADE_SIZE_USDC", "1.0"))
 MIN_ODDS          = float(os.environ.get("MIN_ODDS", "0.05"))
-MAX_ODDS          = float(os.environ.get("MAX_ODDS", "0.95"))
+MAX_ODDS          = float(os.environ.get("MAX_ODDS", "0.97"))
+MAX_SPREAD        = float(os.environ.get("MAX_SPREAD", "0.10"))
+MAX_TRADE_AGE_MINUTES = float(os.environ.get("MAX_TRADE_AGE_MINUTES", "30"))
 EXIT_PROFIT_PCT   = float(os.environ.get("EXIT_PROFIT_PCT", "50"))
 EXIT_LOSS_PCT     = float(os.environ.get("EXIT_LOSS_PCT", "70"))
-MAX_SPREAD        = float(os.environ.get("MAX_SPREAD", "0.10"))
 
 DATA_API  = "https://data-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
@@ -46,9 +49,22 @@ seen_trades: set = set()
 open_positions: dict = {}
 
 
-# POLYMARKET DATA FETCHING
+# TELEGRAM
 
-def get_recent_trades(wallet: str, limit: int = 20) -> list:
+def send_telegram(message: str):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        log.error(f"Telegram failed: {e}")
+
+
+# POLYMARKET DATA
+
+def get_recent_trades(wallet: str, limit: int = 50) -> list:
     try:
         r = requests.get(f"{DATA_API}/trades", params={"user": wallet, "limit": limit}, timeout=10)
         r.raise_for_status()
@@ -59,35 +75,16 @@ def get_recent_trades(wallet: str, limit: int = 20) -> list:
 
 
 def get_token_price(token_id: str) -> Optional[dict]:
-    """
-    Use /price endpoint which returns live data.
-    /book endpoint has a known bug returning 0.01/0.99 ghost spreads.
-    Returns dict with buy_price, sell_price, spread, midpoint.
-    """
     try:
-        # Get buy price
-        r_buy = requests.get(
-            f"{CLOB_API}/price",
-            params={"token_id": token_id, "side": "BUY"},
-            timeout=10
-        )
-        r_sell = requests.get(
-            f"{CLOB_API}/price",
-            params={"token_id": token_id, "side": "SELL"},
-            timeout=10
-        )
-
+        r_buy  = requests.get(f"{CLOB_API}/price", params={"token_id": token_id, "side": "BUY"}, timeout=10)
+        r_sell = requests.get(f"{CLOB_API}/price", params={"token_id": token_id, "side": "SELL"}, timeout=10)
         if not r_buy.ok or not r_sell.ok:
-            log.warning(f"Price fetch failed: BUY={r_buy.status_code} SELL={r_sell.status_code}")
             return None
-
         buy_price  = float(r_buy.json().get("price", 1.0))
         sell_price = float(r_sell.json().get("price", 0.0))
         spread     = buy_price - sell_price
         midpoint   = (buy_price + sell_price) / 2
-
         log.info(f"💰 Price — BUY: {buy_price:.3f} | SELL: {sell_price:.3f} | Spread: {spread:.3f} | Mid: {midpoint:.3f}")
-
         return {
             "buy_price": buy_price,
             "sell_price": sell_price,
@@ -95,36 +92,19 @@ def get_token_price(token_id: str) -> Optional[dict]:
             "midpoint": midpoint,
             "has_liquidity": spread < MAX_SPREAD and buy_price > 0 and sell_price > 0
         }
-
     except Exception as e:
-        log.error(f"Failed to fetch price for {token_id[:10]}...: {e}")
-        return None
-
-
-def get_spread(token_id: str) -> Optional[float]:
-    """Use dedicated /spread endpoint as a cross-check."""
-    try:
-        r = requests.get(f"{CLOB_API}/spread", params={"token_id": token_id}, timeout=10)
-        if r.ok:
-            return float(r.json().get("spread", 1.0))
-        return None
-    except Exception as e:
-        log.error(f"Spread fetch failed: {e}")
+        log.error(f"Failed to fetch price: {e}")
         return None
 
 
 def get_my_positions() -> list:
     try:
-        r = requests.get(
-            f"{DATA_API}/positions",
-            params={"user": MY_PROXY_WALLET, "sizeThreshold": "0.01"},
-            timeout=10
-        )
+        r = requests.get(f"{DATA_API}/positions", params={"user": MY_PROXY_WALLET, "sizeThreshold": "0.01"}, timeout=10)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as e:
-        log.error(f"Failed to fetch my positions: {e}")
+        log.error(f"Failed to fetch positions: {e}")
         return []
 
 
@@ -142,25 +122,21 @@ TRADE DETAILS:
 - Price paid by copied trader: {float(trade.get('price', 0)):.3f} ({float(trade.get('price', 0))*100:.1f}% implied probability)
 - Trader position size: ${float(trade.get('size', 0)) * float(trade.get('price', 0)):.2f} USDC
 
-CURRENT MARKET PRICES (live data):
+CURRENT MARKET PRICES:
 - Best BUY price: {price_data['buy_price']:.3f}
 - Best SELL price: {price_data['sell_price']:.3f}
 - Spread: {price_data['spread']:.3f}
 - Midpoint: {price_data['midpoint']:.3f}
-- Adequate liquidity: {price_data['has_liquidity']}
 
-REJECTION RULES (any one = reject):
-- Spread > {MAX_SPREAD} (too wide, bad execution)
-- BUY price < 0.05 or > 0.95 (near-certain, no value)
-- Market is very niche, obscure, or unclear
+REJECTION RULES:
+- Spread > {MAX_SPREAD}: REJECT
+- BUY price < 0.05 or > 0.97: REJECT
+- Current price more than 15% above trader entry: REJECT (chasing)
+- Market very niche or obscure: REJECT
 
-APPROVAL CRITERIA:
-- Spread under {MAX_SPREAD}
-- Price between 0.05 and 0.95
-- Clear sports or crypto market with reasonable volume
-- Copied trader entering at a price close to current midpoint (not chasing)
+APPROVE if spread is tight, price is fair, and trader entered at reasonable value.
 
-Respond in this exact JSON only, no other text:
+Respond in JSON only:
 {{"approve": true or false, "confidence": 1-10, "reason": "one sentence", "exit_target": 0.0}}"""
 
     try:
@@ -180,7 +156,7 @@ Respond in this exact JSON only, no other text:
         )
         if not r.ok:
             log.error(f"Claude API {r.status_code}: {r.text}")
-            return {"approve": False, "confidence": 0, "reason": f"Claude {r.status_code}", "exit_target": 0}
+            return {"approve": False, "confidence": 0, "reason": f"Claude error {r.status_code}", "exit_target": 0}
         raw = r.json()["content"][0]["text"].strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
@@ -189,14 +165,26 @@ Respond in this exact JSON only, no other text:
         return {"approve": False, "confidence": 0, "reason": f"Error: {e}", "exit_target": 0}
 
 
-# TRADE EXECUTION
+# TRADE EXECUTION — using old py-clob-client with signature_type=1
 
 def get_clob_client():
     try:
         from py_clob_client.client import ClobClient
         from py_clob_client.clob_types import ApiCreds
-        creds = ApiCreds(api_key=PK_API_KEY, api_secret=PK_API_SECRET, api_passphrase=PK_PASSPHRASE)
-        return ClobClient(host=CLOB_API, key=PK_PRIVATE_KEY, chain_id=137, creds=creds)
+        creds = ApiCreds(
+            api_key=PK_API_KEY,
+            api_secret=PK_API_SECRET,
+            api_passphrase=PK_PASSPHRASE
+        )
+        client = ClobClient(
+            CLOB_API,
+            key=PK_PRIVATE_KEY,
+            chain_id=137,
+            signature_type=1,
+            funder=MY_PROXY_WALLET,
+            creds=creds
+        )
+        return client
     except Exception as e:
         log.error(f"Failed to init CLOB client: {e}")
         return None
@@ -208,13 +196,15 @@ def place_trade(token_id: str, side: str, price: float, size_usdc: float) -> Opt
         return None
     try:
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
+        from py_clob_client.order_builder.constants import BUY, SELL
+        s = BUY if side == "BUY" else SELL
         shares = round(size_usdc / price, 4)
-        order_args = MarketOrderArgs(token_id=token_id, amount=shares)
+        order_args = MarketOrderArgs(token_id=token_id, amount=shares, side=s, order_type=OrderType.FOK)
         signed_order = client.create_market_order(order_args)
         resp = client.post_order(signed_order, OrderType.FOK)
         if resp and resp.get("success"):
             order_id = resp.get("orderID", "unknown")
-            log.info(f"✅ Order placed: {order_id} | {side} {shares} shares @ {price}")
+            log.info(f"✅ Order placed: {order_id}")
             return order_id
         else:
             log.warning(f"Order not filled: {resp}")
@@ -230,7 +220,8 @@ def close_position(token_id: str, shares: float, current_price: float) -> bool:
         return False
     try:
         from py_clob_client.clob_types import MarketOrderArgs, OrderType
-        order_args = MarketOrderArgs(token_id=token_id, amount=shares, side="SELL")
+        from py_clob_client.order_builder.constants import SELL
+        order_args = MarketOrderArgs(token_id=token_id, amount=shares, side=SELL, order_type=OrderType.FOK)
         signed_order = client.create_market_order(order_args)
         resp = client.post_order(signed_order, OrderType.FOK)
         if resp and resp.get("success"):
@@ -257,6 +248,7 @@ def monitor_open_positions():
         pos = current_map.get(token_id)
         if not pos:
             log.info(f"Position {entry['title'][:30]}... resolved — removing")
+            send_telegram(f"🏁 <b>Position Resolved</b>\n{entry['title'][:50]}\nOutcome: {entry['outcome']}")
             del open_positions[token_id]
             continue
         entry_price   = entry["entry_price"]
@@ -267,9 +259,11 @@ def monitor_open_positions():
         if pnl_pct >= EXIT_PROFIT_PCT:
             log.info(f"🎯 Profit target hit ({pnl_pct:.1f}%) — closing")
             if close_position(token_id, shares, current_price):
+                send_telegram(f"🎯 <b>Position Closed — Profit!</b>\n{entry['title'][:50]}\nP&L: +{pnl_pct:.1f}%\nExit: {current_price:.3f}")
                 del open_positions[token_id]
         elif pnl_pct <= -EXIT_LOSS_PCT:
             log.info(f"💀 Down {pnl_pct:.1f}% — holding to resolution")
+            send_telegram(f"💀 <b>Position Dead</b>\n{entry['title'][:50]}\nDown {pnl_pct:.1f}% — holding to resolve")
             entry["dead"] = True
 
 
@@ -286,15 +280,14 @@ def process_new_trade(trade: dict, trader_label: str):
     trade_time = trade.get("timestamp", "") or trade.get("createdAt", "")
     if trade_time:
         try:
-            from datetime import datetime, timezone, timedelta
             t = datetime.fromisoformat(trade_time.replace("Z", "+00:00"))
             age_minutes = (datetime.now(timezone.utc) - t).total_seconds() / 60
-            if age_minutes > float(os.environ.get("MAX_TRADE_AGE_MINUTES", "30")):
-                log.info(f"⏭️  Skipped — trade is {age_minutes:.0f} mins old")
+            if age_minutes > MAX_TRADE_AGE_MINUTES:
+                log.info(f"⏭️  Skipped — {age_minutes:.0f} mins old")
                 return
         except:
             pass
-            
+
     log.info(f"🔍 {trader_label}: [{outcome}] '{title}' @ {price:.3f}")
 
     if price < MIN_ODDS or price > MAX_ODDS:
@@ -305,14 +298,13 @@ def process_new_trade(trade: dict, trader_label: str):
         log.info("⏭️  Skipped — no token_id")
         return
 
-    # Get live price data (avoids /book ghost spread bug)
     price_data = get_token_price(token_id)
     if not price_data:
-        log.info("⏭️  Skipped — could not fetch live price")
+        log.info("⏭️  Skipped — could not fetch price")
         return
 
     if not price_data["has_liquidity"]:
-        log.info(f"⏭️  Skipped — spread too wide ({price_data['spread']:.3f} > {MAX_SPREAD})")
+        log.info(f"⏭️  Skipped — spread too wide ({price_data['spread']:.3f})")
         return
 
     analysis = analyse_trade_with_claude(trade, price_data)
@@ -320,9 +312,12 @@ def process_new_trade(trade: dict, trader_label: str):
 
     if not analysis["approve"]:
         log.info("❌ Rejected by Claude")
+        send_telegram(f"❌ <b>Trade Rejected</b>\n{title[:50]}\n[{outcome}] @ {price:.3f}\n💬 {analysis.get('reason')}")
         return
 
     log.info(f"✅ Approved — placing ${TRADE_SIZE_USDC} trade")
+    send_telegram(f"✅ <b>Trade Approved!</b>\n{title[:50]}\n[{outcome}] @ {price:.3f}\n💬 {analysis.get('reason')}\n🎯 Placing ${TRADE_SIZE_USDC} now...")
+
     entry_price = price_data["buy_price"] if side == "BUY" else price_data["sell_price"]
     order_id = place_trade(token_id, side, entry_price, TRADE_SIZE_USDC)
 
@@ -337,17 +332,19 @@ def process_new_trade(trade: dict, trader_label: str):
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "dead": False
         }
-        log.info(f"📌 Tracked | Target: {analysis.get('exit_target', 0):.3f}")
+        send_telegram(f"🟢 <b>Order Placed!</b>\n{title[:50]}\n[{outcome}] @ {entry_price:.3f}\nOrder ID: {order_id}")
+        log.info(f"📌 Position tracked")
+    else:
+        send_telegram(f"⚠️ <b>Order Failed</b>\n{title[:50]}\nClaude approved but execution failed — check logs")
 
 
 def run():
     traders = [
-        (TRADER_1, "Trader1"),
+        (TRADER_1, "Trader1-RN1"),
         (TRADER_2, "Trader2"),
     ]
     log.info("🚀 Polymarket Claude Bot starting...")
-    log.info(f"   Traders: {TRADER_1[:10]}... & {TRADER_2[:10]}...")
-    log.info(f"   Size: ${TRADE_SIZE_USDC} | Poll: {POLL_INTERVAL}s | Max spread: {MAX_SPREAD}")
+    send_telegram("🚀 <b>Bot Started!</b>\nMonitoring 2 traders every 30s\nClaude filtering all trades")
 
     while True:
         try:
@@ -364,6 +361,7 @@ def run():
             break
         except Exception as e:
             log.error(f"Main loop error: {e}")
+            send_telegram(f"⚠️ Bot error: {e}")
         time.sleep(POLL_INTERVAL)
 
 
