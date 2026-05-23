@@ -303,7 +303,9 @@ def process_new_trade(trade: dict, trader_label: str, is_whale: bool = False):
 
 
 def run():
-    traders = [(TRADER_1, "RN1")]
+    traders = []
+    if TRADER_1 and TRADER_1 != "disabled":
+        traders.append((TRADER_1, "RN1"))
     if TRADER_2 and TRADER_2 != "disabled":
         traders.append((TRADER_2, "Trader2"))
 
